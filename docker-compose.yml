@@ -1,0 +1,48 @@
+# Temporal dev server runs locally via CLI (not containerized).
+# Start it first: temporal server start-dev
+#
+# Then: docker compose up --build
+
+services:
+  # -- Backend API (FastAPI) --
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - TEMPORAL_ADDRESS=host.docker.internal:7233
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # -- Worker (Python) --
+  worker-python:
+    build:
+      context: .
+      dockerfile: docker/worker-python.Dockerfile
+    environment:
+      - TEMPORAL_ADDRESS=host.docker.internal:7233
+      - BANKING_BACKEND_URL=http://backend:8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # -- Frontend (nginx + static build) --
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    ports:
+      - "5173:5173"
+    depends_on:
+      backend:
+        condition: service_healthy

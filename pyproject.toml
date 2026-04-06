@@ -1,0 +1,14 @@
+[project]
+name = "banking-demo-workspace"
+version = "0.0.0"
+requires-python = ">=3.12"
+
+[tool.uv.workspace]
+members = ["backend", "workflows/python"]
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "pytest",
+    "pytest-asyncio",
+]
