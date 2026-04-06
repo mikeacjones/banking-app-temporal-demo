@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 
+import temporalio.converter
 from temporalio.client import Client
 from temporalio.worker import Worker
 
@@ -24,11 +26,24 @@ from banking_workflows.activities import (
 )
 
 
+def _get_data_converter() -> temporalio.converter.DataConverter:
+    """Return a data converter with encryption if BANKING_ENCRYPT=1."""
+    if os.environ.get("BANKING_ENCRYPT", "") == "1":
+        from banking_workflows.codec import EncryptionCodec
+
+        print("Encryption enabled")
+        return dataclasses.replace(
+            temporalio.converter.default(),
+            payload_codec=EncryptionCodec(),
+        )
+    return temporalio.converter.default()
+
+
 async def run_worker(client: Client | None = None) -> None:
     """Start the Temporal worker."""
     if client is None:
         addr = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
-        client = await Client.connect(addr)
+        client = await Client.connect(addr, data_converter=_get_data_converter())
 
     worker = Worker(
         client,

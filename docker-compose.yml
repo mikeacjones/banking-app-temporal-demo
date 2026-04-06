@@ -2,6 +2,7 @@
 # Start it first: temporal server start-dev
 #
 # Then: docker compose up --build
+# With encryption: BANKING_ENCRYPT=1 docker compose up --build
 
 services:
   # -- Backend API (FastAPI) --
@@ -30,8 +31,23 @@ services:
     environment:
       - TEMPORAL_ADDRESS=host.docker.internal:7233
       - BANKING_BACKEND_URL=http://backend:8000
+      - BANKING_ENCRYPT=${BANKING_ENCRYPT:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # -- Codec Server (only when BANKING_ENCRYPT=1) --
+  codec-server:
+    build:
+      context: .
+      dockerfile: docker/worker-python.Dockerfile
+    command: ["uv", "run", "--package", "banking-demo-workflows", "python", "-m", "banking_workflows.codec_server"]
+    ports:
+      - "8081:8081"
+    profiles:
+      - encrypt
     depends_on:
       backend:
         condition: service_healthy

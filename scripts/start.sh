@@ -2,14 +2,26 @@
 set -e
 
 # Banking Transfer Demo — Launcher
-# Usage: ./scripts/start.sh
+# Usage: ./scripts/start.sh [--encrypt]
 #
 # Prefers Docker for backend/worker/frontend.
 # Falls back to running everything locally if Docker isn't available.
 # Temporal CLI dev server always runs on the host.
+#
+# Options:
+#   --encrypt   Enable AES-GCM payload encryption + codec server
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MISSING=()
+ENCRYPT=""
+
+# -- Parse flags --
+for arg in "$@"; do
+  case "$arg" in
+    --encrypt) ENCRYPT=1 ;;
+    *) echo "Unknown option: $arg"; exit 1 ;;
+  esac
+done
 
 # -- Check Temporal CLI (always required) --
 command -v temporal >/dev/null 2>&1 || MISSING+=("temporal CLI  — brew install temporal")
@@ -42,7 +54,7 @@ cleanup() {
   echo ""
   echo "Shutting down..."
   if [ "$MODE" = "docker" ]; then
-    docker compose down --remove-orphans 2>/dev/null || true
+    docker compose --profile encrypt down --remove-orphans 2>/dev/null || true
   fi
   for pid in "${PIDS[@]}"; do
     kill "$pid" 2>/dev/null || true
@@ -55,17 +67,20 @@ trap cleanup SIGINT SIGTERM
 
 echo "======================================"
 echo "  Banking Transfer Demo Launcher"
+if [ "$ENCRYPT" = "1" ]; then
+  echo "  (encryption enabled)"
+fi
 echo "======================================"
 echo ""
 
 # -- Clean up stale containers --
 if [ "$MODE" = "docker" ]; then
-  docker compose down --remove-orphans 2>/dev/null || true
+  docker compose --profile encrypt down --remove-orphans 2>/dev/null || true
 fi
 
 # -- Start Temporal dev server (always on host) --
 echo "Starting Temporal dev server..."
-temporal server start-dev --log-level warn &
+temporal server start-dev --log-level warn --db-filename "/tmp/banking-demo-temporal-$$.db" &
 PIDS+=($!)
 
 echo "Waiting for Temporal..."
@@ -76,12 +91,28 @@ for i in $(seq 1 15); do
   sleep 1
 done
 
+# Register search attribute for Advanced Visibility scenario
+echo "Registering search attributes..."
+temporal operator search-attribute create --name Step --type Keyword 2>/dev/null || true
+
 # =============================================
 if [ "$MODE" = "docker" ]; then
 # =============================================
 
+  DOCKER_PROFILES=""
+  if [ "$ENCRYPT" = "1" ]; then
+    DOCKER_PROFILES="--profile encrypt"
+  fi
+
   echo "Starting Docker containers..."
-  docker compose up --build -d
+  BANKING_ENCRYPT="${ENCRYPT}" docker compose $DOCKER_PROFILES up --build -d
+
+  BANNER_EXTRA=""
+  if [ "$ENCRYPT" = "1" ]; then
+    BANNER_EXTRA="\n  Encryption: ON (AES-GCM)"
+    BANNER_EXTRA="$BANNER_EXTRA\n  Codec:      http://localhost:8081"
+    BANNER_EXTRA="$BANNER_EXTRA\n              (set as codec endpoint in Temporal UI)"
+  fi
 
   echo ""
   echo "======================================"
@@ -90,6 +121,7 @@ if [ "$MODE" = "docker" ]; then
   echo "  App:        http://localhost:5173"
   echo "  API:        http://localhost:8000"
   echo "  Temporal:   http://localhost:8233"
+  echo -e "$BANNER_EXTRA"
   echo ""
   echo "  Ctrl+C to stop everything"
   echo "======================================"
@@ -117,12 +149,24 @@ else
   done
 
   echo "Starting worker..."
-  BANKING_BACKEND_URL=http://localhost:8000 uv run --package banking-demo-workflows worker &
+  BANKING_ENCRYPT="${ENCRYPT}" BANKING_BACKEND_URL=http://localhost:8000 uv run --package banking-demo-workflows worker &
   PIDS+=($!)
+
+  # Start codec server if encryption is enabled
+  if [ "$ENCRYPT" = "1" ]; then
+    echo "Starting codec server on :8081..."
+    uv run python -m banking_workflows.codec_server &
+    PIDS+=($!)
+  fi
 
   echo "Starting frontend..."
   (cd "$ROOT_DIR/frontend" && npm run dev -- --open) &
   PIDS+=($!)
+
+  BANNER_EXTRA=""
+  if [ "$ENCRYPT" = "1" ]; then
+    BANNER_EXTRA="  Encryption: ON (AES-GCM)\n  Codec:      http://localhost:8081\n              (set as codec endpoint in Temporal UI)\n"
+  fi
 
   echo ""
   echo "======================================"
@@ -131,6 +175,9 @@ else
   echo "  App:        http://localhost:5173"
   echo "  API:        http://localhost:8000"
   echo "  Temporal:   http://localhost:8233"
+  if [ -n "$BANNER_EXTRA" ]; then
+    echo -e "$BANNER_EXTRA"
+  fi
   echo ""
   echo "  Ctrl+C to stop all services"
   echo "======================================"

@@ -6,6 +6,7 @@ dependencies = [
     "temporalio>=1.9",
     "banking-demo-backend",
     "aiohttp>=3.9",
+    "cryptography>=44.0",
 ]
 
 [project.scripts]

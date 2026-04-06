@@ -7,7 +7,8 @@ A live, interactive demo showing how [Temporal](https://temporal.io) handles mon
 **Prerequisites:** [Temporal CLI](https://docs.temporal.io/cli) + either Docker or ([uv](https://docs.astral.sh/uv/) + [Node.js](https://nodejs.org/))
 
 ```bash
-./scripts/start.sh
+./scripts/start.sh              # Standard launch
+./scripts/start.sh --encrypt    # Launch with payload encryption
 ```
 
 The script auto-detects your environment:
@@ -46,6 +47,23 @@ Switch to the **Bank Operations** tab to act as a bank employee. When running th
 
 The Temporal UI at http://localhost:8233 shows actual workflow executions with full event history.
 
+## Payload Encryption
+
+Launch with `--encrypt` to enable AES-GCM encryption on all workflow and activity payloads:
+
+```bash
+./scripts/start.sh --encrypt
+```
+
+This starts the worker with an encryption codec and a codec server on http://localhost:8081. The worker encrypts all payloads before they reach the Temporal server and decrypts them when they come back — the Temporal server never sees plaintext data.
+
+**What you'll see in the Temporal UI:**
+- All activity inputs/outputs show as `binary/encrypted` — unreadable
+- To decrypt, click the 3D glasses icon in the Temporal UI and set the codec endpoint to `http://localhost:8081`
+- Payloads are decrypted client-side in your browser — nothing goes back through the Temporal server
+
+The backend does not use the codec. It starts workflows and sends signals to Temporal, but all sensitive data flows through the worker which handles encryption/decryption. The worker communicates results back to the backend via plain HTTP (internal API), outside of Temporal's data path.
+
 ## Architecture
 
 ```
@@ -58,13 +76,17 @@ FastAPI Backend (Python)
            |
 Temporal Dev Server (CLI, on host)
            |
-Python Worker
+Python Worker [encrypts/decrypts payloads when --encrypt]
     |-- AccountTransferWorkflow (happy path)
     |-- AccountTransferWorkflowScenarios (dynamic, 5 other scenarios)
     +-- Activities -> Backend internal API
+
+Codec Server (optional, --encrypt only)
+    |-- POST /encode — encrypts payloads
+    +-- POST /decode — decrypts payloads for Temporal UI
 ```
 
-Two workflow classes mirror the [money-transfer-demo](https://github.com/temporal-sa/money-transfer-demo) pattern:
+Two workflow classes:
 - **`AccountTransferWorkflow`** — clean happy path
 - **`AccountTransferWorkflowScenarios`** — `@workflow.defn(dynamic=True)`, branches on workflow type name for the other 5 scenarios
 
@@ -85,8 +107,11 @@ Two workflow classes mirror the [money-transfer-demo](https://github.com/tempora
 │   └── src/components/    # PhoneFrame, TransferTracker, BankOperations, etc.
 ├── backend/               # FastAPI + mock bank services (Python)
 ├── workflows/python/      # Python worker — two workflow classes + activities
+│   └── src/banking_workflows/
+│       ├── codec.py           # AES-GCM PayloadCodec (used when --encrypt)
+│       └── codec_server.py    # HTTP codec server for Temporal UI decryption
 ├── docker/                # Dockerfiles + nginx config
-├── docker-compose.yml     # Backend, worker, frontend containers
+├── docker-compose.yml     # Backend, worker, frontend + codec-server (encrypt profile)
 └── scripts/start.sh       # One-command launcher
 ```
 
@@ -97,10 +122,14 @@ Two workflow classes mirror the [money-transfer-demo](https://github.com/tempora
 uv sync --all-packages && cd frontend && npm install
 
 # Run individual services
-temporal server start-dev                                                             # Temporal on :7233
-uv run --package banking-demo-backend server                                          # FastAPI on :8000
+temporal server start-dev                                                                # Temporal on :7233
+uv run --package banking-demo-backend server                                             # FastAPI on :8000
 BANKING_BACKEND_URL=http://localhost:8000 uv run --package banking-demo-workflows worker  # Python worker
-cd frontend && npm run dev                                                            # Vite on :5173
+cd frontend && npm run dev                                                               # Vite on :5173
+
+# With encryption
+BANKING_ENCRYPT=1 BANKING_BACKEND_URL=http://localhost:8000 uv run --package banking-demo-workflows worker
+uv run python -m banking_workflows.codec_server                                          # Codec server on :8081
 ```
 
 ## Settings
