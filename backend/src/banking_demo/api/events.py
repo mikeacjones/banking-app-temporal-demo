@@ -74,8 +74,8 @@ async def event_generator(transfer_id: str):
                 }
                 return
 
-            # Non-retryable failure (e.g., invalid account on validate)
-            if status == "failed" and step in ("validate", "deposit"):
+            # Non-retryable failure on validate (no side effects yet, no compensation needed)
+            if status == "failed" and step == "validate":
                 yield {
                     "event": "transfer_complete",
                     "data": json.dumps({"final_status": "failed"}),

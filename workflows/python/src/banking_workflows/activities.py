@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
-from datetime import datetime
+from datetime import timedelta
 
 from temporalio import activity
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 
-from banking_demo.models import StepStatus
+from banking_workflows.shared_objects import DepositResponse, TransferInput
+
+logging.basicConfig(level=logging.INFO)
 
 _BACKEND_URL = os.environ.get("BANKING_BACKEND_URL", "")
 
@@ -15,21 +19,22 @@ _BACKEND_URL = os.environ.get("BANKING_BACKEND_URL", "")
 async def _emit_event(
     transfer_id: str,
     step: str,
-    status: StepStatus,
+    status: str,
     *,
     attempt: int = 1,
     max_attempts: int = 1,
     error: str | None = None,
     detail: str = "",
 ) -> None:
-    """Push an event via HTTP to the backend."""
+    """Push an SSE event to the backend for the UI."""
     if _BACKEND_URL:
         import aiohttp
+        from datetime import datetime
 
         payload = {
             "transfer_id": transfer_id,
             "step": step,
-            "status": status.value,
+            "status": status,
             "attempt": attempt,
             "max_attempts": max_attempts,
             "error": error,
@@ -43,43 +48,19 @@ async def _emit_event(
                 ) as resp:
                     resp.raise_for_status()
         except Exception:
-            pass  # Best effort
+            pass
     else:
         from banking_demo.api.events import emit_event
+        from banking_demo.models import StepStatus
 
         await emit_event(
-            transfer_id,
-            step,
-            status,
-            attempt=attempt,
-            max_attempts=max_attempts,
-            error=error,
-            detail=detail,
+            transfer_id, step, StepStatus(status),
+            attempt=attempt, max_attempts=max_attempts,
+            error=error, detail=detail,
         )
 
 
-async def _should_fail_deposit(transfer_id: str) -> bool:
-    """Check with backend if deposit should fail (API Downtime scenario)."""
-    if _BACKEND_URL:
-        import aiohttp
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{_BACKEND_URL}/api/internal/should-fail-deposit/{transfer_id}"
-                ) as resp:
-                    data = await resp.json()
-                    return data.get("should_fail", False)
-        except Exception:
-            return False
-    else:
-        from banking_demo.config import should_fail_deposit
-
-        return should_fail_deposit(transfer_id)
-
-
 async def _register_pending_approval(transfer_id: str, payload: dict) -> None:
-    """Register a pending approval with the backend."""
     if _BACKEND_URL:
         import aiohttp
 
@@ -94,230 +75,10 @@ async def _register_pending_approval(transfer_id: str, payload: dict) -> None:
             pass
     else:
         from banking_demo import config
-
         config.pending_approvals[transfer_id] = payload
 
 
-@activity.defn
-async def validate_activity(transfer_input: dict) -> dict:
-    """Validate the transfer: accounts exist, valid amount."""
-    transfer_id = transfer_input["transfer_id"]
-    workflow_type = transfer_input.get("workflow_type", "")
-    await _emit_event(transfer_id, "validate", StepStatus.RUNNING)
-
-    await asyncio.sleep(0.3)
-
-    # Invalid Account scenario: non-retryable failure
-    if workflow_type == "AccountTransferWorkflowInvalidAccount":
-        from banking_demo.config import is_invalid_account
-
-        if is_invalid_account(transfer_input["to_account"]):
-            await _emit_event(
-                transfer_id,
-                "validate",
-                StepStatus.FAILED,
-                error=f"Account {transfer_input['to_account']} does not exist",
-            )
-            raise ApplicationError(
-                f"Account {transfer_input['to_account']} does not exist",
-                type="InvalidAccountError",
-                non_retryable=True,
-            )
-
-    await _emit_event(
-        transfer_id,
-        "validate",
-        StepStatus.COMPLETED,
-        detail=f"Validated: {transfer_input['from_account']} -> {transfer_input['to_account']}",
-    )
-    return {
-        "valid": True,
-        "from_account": transfer_input["from_account"],
-        "to_account": transfer_input["to_account"],
-        "amount": transfer_input["amount"],
-    }
-
-
-@activity.defn
-async def withdraw_activity(transfer_input: dict) -> dict:
-    """Withdraw funds from source account."""
-    transfer_id = transfer_input["transfer_id"]
-    workflow_type = transfer_input.get("workflow_type", "")
-    info = activity.info()
-    await _emit_event(transfer_id, "withdraw", StepStatus.RUNNING)
-
-    await asyncio.sleep(0.5)
-
-    # API Downtime scenario: withdraw fails with retryable error
-    if workflow_type == "AccountTransferWorkflowAPIDowntime":
-        if await _should_fail_deposit(transfer_id):
-            await _emit_event(
-                transfer_id,
-                "withdraw",
-                StepStatus.RETRYING,
-                attempt=info.attempt,
-                max_attempts=10,
-                error="Bank API temporarily unavailable",
-            )
-            raise RuntimeError("Bank API temporarily unavailable — connection timeout")
-
-    from uuid import uuid4
-
-    reference_id = f"WD-{uuid4().hex[:8]}"
-    await _emit_event(
-        transfer_id,
-        "withdraw",
-        StepStatus.COMPLETED,
-        detail=f"Withdrawn ${transfer_input['amount']:.2f} (ref: {reference_id})",
-    )
-    return {
-        "reference_id": reference_id,
-        "amount": transfer_input["amount"],
-        "status": "completed",
-    }
-
-
-@activity.defn
-async def deposit_activity(transfer_input: dict) -> dict:
-    """Deposit funds to destination account."""
-    transfer_id = transfer_input["transfer_id"]
-    workflow_type = transfer_input.get("workflow_type", "")
-    info = activity.info()
-    await _emit_event(
-        transfer_id,
-        "deposit",
-        StepStatus.RUNNING,
-        attempt=info.attempt,
-        max_attempts=10,
-    )
-
-    await asyncio.sleep(0.5)
-
-    # Invalid Account scenario: non-retryable failure on deposit
-    if workflow_type == "AccountTransferWorkflowInvalidAccount":
-        from banking_demo.config import is_invalid_account
-
-        if is_invalid_account(transfer_input["to_account"]):
-            await _emit_event(
-                transfer_id,
-                "deposit",
-                StepStatus.FAILED,
-                error=f"Account {transfer_input['to_account']} is invalid",
-            )
-            raise ApplicationError(
-                f"Account {transfer_input['to_account']} is invalid",
-                type="InvalidAccountError",
-                non_retryable=True,
-            )
-
-    # API Downtime scenario: deposit fails with retryable error
-    if workflow_type == "AccountTransferWorkflowAPIDowntime":
-        if await _should_fail_deposit(transfer_id):
-            await _emit_event(
-                transfer_id,
-                "deposit",
-                StepStatus.RETRYING,
-                attempt=info.attempt,
-                max_attempts=10,
-                error="Deposit API temporarily unavailable",
-            )
-            raise RuntimeError("Deposit API temporarily unavailable — connection timeout")
-
-    from uuid import uuid4
-
-    reference_id = f"DEP-{uuid4().hex[:8]}"
-    await _emit_event(
-        transfer_id,
-        "deposit",
-        StepStatus.COMPLETED,
-        detail=f"Deposited ${transfer_input['amount']:.2f} (ref: {reference_id})",
-    )
-    return {
-        "reference_id": reference_id,
-        "amount": transfer_input["amount"],
-        "status": "completed",
-    }
-
-
-@activity.defn
-async def undo_withdraw_activity(transfer_input: dict) -> dict:
-    """Compensation: reverse a withdrawal."""
-    transfer_id = transfer_input["transfer_id"]
-    await _emit_event(transfer_id, "undo_withdraw", StepStatus.RUNNING)
-
-    await asyncio.sleep(0.3)
-
-    from uuid import uuid4
-
-    reference_id = f"UNDO-{uuid4().hex[:8]}"
-    await _emit_event(
-        transfer_id,
-        "undo_withdraw",
-        StepStatus.COMPLETED,
-        detail=f"Withdrawal reversed: ${transfer_input['amount']:.2f} (ref: {reference_id})",
-    )
-    return {
-        "reference_id": reference_id,
-        "amount": transfer_input["amount"],
-        "status": "reversed",
-    }
-
-
-@activity.defn
-async def send_notification_activity(transfer_input: dict) -> dict:
-    """Send notification about transfer result."""
-    transfer_id = transfer_input["transfer_id"]
-    success = transfer_input.get("success", True)
-
-    await asyncio.sleep(0.2)
-
-    if success:
-        await _emit_event(
-            transfer_id,
-            "send_notification_success",
-            StepStatus.COMPLETED,
-            detail="Customer notified: Your transfer has been completed successfully!",
-        )
-    else:
-        await _emit_event(
-            transfer_id,
-            "send_notification_failure",
-            StepStatus.COMPLETED,
-            detail="Customer notified: Your transfer could not be completed. "
-            "Funds have been returned to your account.",
-        )
-    return {"notified": True, "success": success}
-
-
-@activity.defn
-async def register_approval_activity(transfer_input: dict) -> dict:
-    """Register this transfer as needing approval (human-in-the-loop)."""
-    transfer_id = transfer_input["transfer_id"]
-    await _emit_event(
-        transfer_id,
-        "approval_wait",
-        StepStatus.RUNNING,
-        detail="Awaiting bank employee approval...",
-    )
-
-    await _register_pending_approval(
-        transfer_id,
-        {
-            "transfer_id": transfer_id,
-            "from_account": transfer_input["from_account"],
-            "to_account": transfer_input["to_account"],
-            "amount": transfer_input["amount"],
-            "created_at": datetime.now().isoformat(),
-        },
-    )
-    return {"registered": True}
-
-
-@activity.defn
-async def remove_pending_approval_activity(transfer_input: dict) -> dict:
-    """Remove a pending approval (after timeout or denial)."""
-    transfer_id = transfer_input["transfer_id"]
-
+async def _remove_pending_approval(transfer_id: str) -> None:
     if _BACKEND_URL:
         import aiohttp
 
@@ -331,13 +92,160 @@ async def remove_pending_approval_activity(transfer_input: dict) -> dict:
             pass
     else:
         from banking_demo import config
-
         config.pending_approvals.pop(transfer_id, None)
 
-    await _emit_event(
-        transfer_id,
-        "approval_wait",
-        StepStatus.FAILED,
-        detail="Approval timed out — transfer denied automatically",
+
+class AccountTransferActivities:
+
+    API_DOWNTIME = "AccountTransferWorkflowAPIDowntime"
+    INVALID_ACCOUNT = "AccountTransferWorkflowInvalidAccount"
+
+    retry_policy = RetryPolicy(
+        initial_interval=timedelta(seconds=1),
+        backoff_coefficient=2,
+        maximum_interval=timedelta(seconds=30),
     )
-    return {"removed": True}
+
+    async def simulate_external_operation_ms(self, ms: int):
+        try:
+            await asyncio.sleep(ms / 1000)
+        except InterruptedError as e:
+            print(e.__traceback__)
+
+    async def simulate_external_operation(
+        self, ms: int, workflow_type: str, attempt: int
+    ):
+        await self.simulate_external_operation_ms(ms / attempt)
+        return workflow_type if attempt < 5 else "NoError"
+
+    @activity.defn
+    async def validate(self, input: TransferInput) -> str:
+        activity.logger.info(f"Validate activity started. Input {input}")
+        transfer_id = activity.info().workflow_id.replace("transfer-", "")
+        await _emit_event(transfer_id, "validate", "running")
+
+        await self.simulate_external_operation_ms(1000)
+
+        await _emit_event(
+            transfer_id, "validate", "completed",
+            detail=f"Validated: {input.fromAccount} -> {input.toAccount}",
+        )
+        return "SUCCESS"
+
+    @activity.defn
+    async def withdraw(
+        self, idempotencyKey: str, amount: float, workflow_type: str
+    ) -> str:
+        activity.logger.info(f"Withdraw activity started. amount {amount}")
+        transfer_id = activity.info().workflow_id.replace("transfer-", "")
+        attempt = activity.info().attempt
+        await _emit_event(transfer_id, "withdraw", "running", attempt=attempt, max_attempts=10)
+
+        error = await self.simulate_external_operation(1000, workflow_type, attempt)
+        activity.logger.info(
+            f"Withdraw call complete, type {workflow_type}, error {error}"
+        )
+
+        if self.API_DOWNTIME == error:
+            await _emit_event(
+                transfer_id, "withdraw", "retrying",
+                attempt=attempt, max_attempts=10,
+                error="Withdraw API unavailable",
+            )
+            raise ApplicationError("Withdraw activity failed, API unavailable")
+
+        await _emit_event(
+            transfer_id, "withdraw", "completed",
+            detail=f"Withdrawn ${amount:.2f}",
+        )
+        return "SUCCESS"
+
+    @activity.defn
+    async def deposit(
+        self, idempotencyKey: str, amount: float, workflow_type: str
+    ) -> DepositResponse:
+        activity.logger.info(f"Deposit activity started. amount {amount}")
+        transfer_id = activity.info().workflow_id.replace("transfer-", "")
+        attempt = activity.info().attempt
+        await _emit_event(transfer_id, "deposit", "running", attempt=attempt, max_attempts=10)
+
+        error = await self.simulate_external_operation(1000, workflow_type, attempt)
+        activity.logger.info(
+            f"Deposit activity complete. type {workflow_type} error {error}"
+        )
+
+        if self.INVALID_ACCOUNT == error:
+            await _emit_event(
+                transfer_id, "deposit", "failed",
+                error="Account is invalid",
+            )
+            raise ApplicationError(
+                "Deposit activity failed, account is invalid",
+                type="InvalidAccount",
+                non_retryable=True,
+            )
+
+        await _emit_event(
+            transfer_id, "deposit", "completed",
+            detail=f"Deposited ${amount:.2f}",
+        )
+        return DepositResponse("example-transfer-id")
+
+    @activity.defn
+    async def sendNotification(self, input: TransferInput) -> str:
+        activity.logger.info(f"Send notification activity started. input = {input}")
+        transfer_id = activity.info().workflow_id.replace("transfer-", "")
+
+        await self.simulate_external_operation_ms(1000)
+
+        await _emit_event(
+            transfer_id, "send_notification_success", "completed",
+            detail="Customer notified: Transfer completed successfully!",
+        )
+        return "SUCCESS"
+
+    @activity.defn
+    async def undoWithdraw(self, amount: float) -> bool:
+        transfer_id = activity.info().workflow_id.replace("transfer-", "")
+        await _emit_event(transfer_id, "undo_withdraw", "running")
+
+        await self.simulate_external_operation_ms(1000)
+
+        await _emit_event(
+            transfer_id, "undo_withdraw", "completed",
+            detail=f"Withdrawal reversed: ${amount:.2f}",
+        )
+        return True
+
+    @activity.defn
+    async def registerApproval(self, input: TransferInput) -> str:
+        """Register a pending approval for the Bank Operations tab."""
+        transfer_id = activity.info().workflow_id.replace("transfer-", "")
+        await _emit_event(
+            transfer_id, "approval_wait", "running",
+            detail="Awaiting bank employee approval...",
+        )
+        from datetime import datetime
+
+        await _register_pending_approval(
+            transfer_id,
+            {
+                "transfer_id": transfer_id,
+                "from_account": input.fromAccount,
+                "to_account": input.toAccount,
+                "amount": input.amount,
+                "created_at": datetime.now().isoformat(),
+            },
+        )
+        return "SUCCESS"
+
+    @activity.defn
+    async def removeApproval(self, input: TransferInput) -> str:
+        """Remove a pending approval after timeout/denial."""
+        transfer_id = activity.info().workflow_id.replace("transfer-", "")
+        await _remove_pending_approval(transfer_id)
+        await _emit_event(
+            transfer_id, "approval_wait", "failed",
+            detail="Approval timed out — transfer denied automatically",
+        )
+        return "SUCCESS"

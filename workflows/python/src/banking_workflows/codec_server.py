@@ -24,7 +24,12 @@ def build_codec_server() -> web.Application:
     async def cors_options(req: web.Request) -> web.Response:
         resp = web.Response()
         origin = req.headers.get(hdrs.ORIGIN, "")
-        if origin in ("http://localhost:8233", "http://localhost:8080"):
+        allowed = (
+            "http://localhost:8233",
+            "http://localhost:8080",
+            "https://cloud.temporal.io",
+        )
+        if origin in allowed:
             resp.headers[hdrs.ACCESS_CONTROL_ALLOW_ORIGIN] = origin
             resp.headers[hdrs.ACCESS_CONTROL_ALLOW_METHODS] = "POST"
             resp.headers[hdrs.ACCESS_CONTROL_ALLOW_HEADERS] = (

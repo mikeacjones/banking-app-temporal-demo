@@ -29,6 +29,9 @@ Thumbs.db
 # Environment
 .env
 .env.local
+cloud.env
+*.pem
+*.key
 
 # Claude Code
 .claude/
