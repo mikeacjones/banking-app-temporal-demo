@@ -38,10 +38,27 @@ _temporal_client = None
 async def get_temporal_client():
     global _temporal_client
     if _temporal_client is None:
-        from temporalio.client import Client
+        from temporalio.client import Client, TLSConfig
 
         addr = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
-        _temporal_client = await Client.connect(addr)
+        namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
+        api_key = os.environ.get("TEMPORAL_API_KEY", "")
+        tls_cert_path = os.environ.get("TEMPORAL_CERT_PATH", "")
+        tls_key_path = os.environ.get("TEMPORAL_KEY_PATH", "")
+
+        kwargs: dict = {"target_host": addr, "namespace": namespace}
+
+        if api_key:
+            kwargs["api_key"] = api_key
+            kwargs["tls"] = True
+        elif tls_cert_path and tls_key_path:
+            with open(tls_cert_path, "rb") as f:
+                cert = f.read()
+            with open(tls_key_path, "rb") as f:
+                key = f.read()
+            kwargs["tls"] = TLSConfig(client_cert=cert, client_private_key=key)
+
+        _temporal_client = await Client.connect(**kwargs)
     return _temporal_client
 
 
@@ -108,14 +125,12 @@ async def create_transfer(request: TransferRequest):
     await client.start_workflow(
         workflow_type,
         {
-            "transfer_id": transfer_id,
-            "from_account": request.from_account,
-            "to_account": request.to_account,
             "amount": request.amount,
-            "workflow_type": workflow_type,
+            "fromAccount": request.from_account,
+            "toAccount": request.to_account,
         },
         id=f"transfer-{transfer_id}",
-        task_queue="MoneyTransfer",
+        task_queue=os.environ.get("TEMPORAL_TASK_QUEUE") or "MoneyTransfer",
     )
 
     return {"transfer_id": transfer_id, "status": "accepted"}
@@ -153,7 +168,7 @@ async def approve_transfer(transfer_id: str):
 
     client = await get_temporal_client()
     handle = client.get_workflow_handle(f"transfer-{transfer_id}")
-    await handle.signal("approve_transfer")
+    await handle.signal("approveTransfer")
 
     config.pending_approvals.pop(transfer_id, None)
 
@@ -169,12 +184,9 @@ async def approve_transfer(transfer_id: str):
 
 @app.post("/api/bank/deny/{transfer_id}")
 async def deny_transfer(transfer_id: str):
+    """Remove from pending approvals — workflow will timeout and compensate."""
     if transfer_id not in config.pending_approvals:
         raise HTTPException(status_code=404, detail="No pending approval for this transfer")
-
-    client = await get_temporal_client()
-    handle = client.get_workflow_handle(f"transfer-{transfer_id}")
-    await handle.signal("deny_transfer")
 
     config.pending_approvals.pop(transfer_id, None)
 
@@ -182,7 +194,7 @@ async def deny_transfer(transfer_id: str):
         transfer_id,
         "approval_wait",
         StepStatus.FAILED,
-        detail="Transfer denied by bank operations",
+        detail="Transfer denied — will timeout and compensate",
     )
 
     return {"status": "denied", "transfer_id": transfer_id}

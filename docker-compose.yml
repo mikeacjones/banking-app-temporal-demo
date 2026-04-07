@@ -1,8 +1,8 @@
 # Temporal dev server runs locally via CLI (not containerized).
-# Start it first: temporal server start-dev
 #
-# Then: docker compose up --build
-# With encryption: BANKING_ENCRYPT=1 docker compose up --build
+# Local:       docker compose up --build
+# Encryption:  BANKING_ENCRYPT=1 docker compose --profile encrypt up --build
+# Cloud:       Set TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, and auth env vars
 
 services:
   # -- Backend API (FastAPI) --
@@ -13,7 +13,15 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - TEMPORAL_ADDRESS=host.docker.internal:7233
+      - TEMPORAL_ADDRESS=${TEMPORAL_ADDRESS:-host.docker.internal:7233}
+      - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
+      - TEMPORAL_API_KEY=${TEMPORAL_API_KEY:-}
+      - TEMPORAL_CERT_PATH=${TEMPORAL_CERT_PATH:+/certs/client.pem}
+      - TEMPORAL_KEY_PATH=${TEMPORAL_KEY_PATH:+/certs/client.key}
+      - TEMPORAL_TASK_QUEUE=${TEMPORAL_TASK_QUEUE:-}
+    volumes:
+      - ${TEMPORAL_CERT_PATH:-/dev/null}:/certs/client.pem:ro
+      - ${TEMPORAL_KEY_PATH:-/dev/null}:/certs/client.key:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -29,9 +37,17 @@ services:
       context: .
       dockerfile: docker/worker-python.Dockerfile
     environment:
-      - TEMPORAL_ADDRESS=host.docker.internal:7233
+      - TEMPORAL_ADDRESS=${TEMPORAL_ADDRESS:-host.docker.internal:7233}
+      - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
+      - TEMPORAL_API_KEY=${TEMPORAL_API_KEY:-}
+      - TEMPORAL_CERT_PATH=${TEMPORAL_CERT_PATH:+/certs/client.pem}
+      - TEMPORAL_KEY_PATH=${TEMPORAL_KEY_PATH:+/certs/client.key}
+      - TEMPORAL_TASK_QUEUE=${TEMPORAL_TASK_QUEUE:-}
       - BANKING_BACKEND_URL=http://backend:8000
       - BANKING_ENCRYPT=${BANKING_ENCRYPT:-}
+    volumes:
+      - ${TEMPORAL_CERT_PATH:-/dev/null}:/certs/client.pem:ro
+      - ${TEMPORAL_KEY_PATH:-/dev/null}:/certs/client.key:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

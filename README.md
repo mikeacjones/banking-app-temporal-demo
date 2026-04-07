@@ -7,8 +7,10 @@ A live, interactive demo showing how [Temporal](https://temporal.io) handles mon
 **Prerequisites:** [Temporal CLI](https://docs.temporal.io/cli) + either Docker or ([uv](https://docs.astral.sh/uv/) + [Node.js](https://nodejs.org/))
 
 ```bash
-./scripts/start.sh              # Standard launch
-./scripts/start.sh --encrypt    # Launch with payload encryption
+./scripts/start.sh                              # Local Temporal dev server
+./scripts/start.sh --encrypt                    # Local + payload encryption
+./scripts/start.sh --cloud-env cloud.env        # Temporal Cloud
+./scripts/start.sh --cloud-env cloud.env --encrypt  # Cloud + encryption
 ```
 
 The script auto-detects your environment:
@@ -63,6 +65,25 @@ This starts the worker with an encryption codec and a codec server on http://loc
 - Payloads are decrypted client-side in your browser — nothing goes back through the Temporal server
 
 The backend does not use the codec. It starts workflows and sends signals to Temporal, but all sensitive data flows through the worker which handles encryption/decryption. The worker communicates results back to the backend via plain HTTP (internal API), outside of Temporal's data path.
+
+## Temporal Cloud
+
+To connect to Temporal Cloud instead of a local dev server:
+
+```bash
+cp cloud.env.example cloud.env
+# Edit cloud.env with your namespace, address, and auth credentials
+./scripts/start.sh --cloud-env cloud.env
+```
+
+The env file supports two authentication methods:
+
+| Method | Variables |
+|---|---|
+| **API Key** (preferred) | `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY` |
+| **mTLS certificates** | `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_CERT_PATH`, `TEMPORAL_KEY_PATH` |
+
+When using `--cloud-env`, no local Temporal server is started. The worker and backend connect directly to your Cloud namespace. Combine with `--encrypt` for encrypted payloads on Cloud.
 
 ## Architecture
 

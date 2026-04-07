@@ -3,183 +3,181 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from datetime import timedelta
+from typing import Any
 
 from temporalio import workflow
-from temporalio.common import RawValue, RetryPolicy
+from temporalio.common import RawValue, SearchAttributeKey
+from temporalio.exceptions import ApplicationError
+
+from banking_workflows.shared_objects import (
+    DepositResponse,
+    TransferInput,
+    TransferOutput,
+    TransferStatus,
+)
 
 with workflow.unsafe.imports_passed_through():
-    from banking_workflows.activities import (
-        deposit_activity,
-        register_approval_activity,
-        remove_pending_approval_activity,
-        send_notification_activity,
-        undo_withdraw_activity,
-        validate_activity,
-        withdraw_activity,
-    )
-
-DEFAULT_RETRY = RetryPolicy(maximum_attempts=3)
+    from banking_workflows.activities import AccountTransferActivities
 
 
 @workflow.defn(dynamic=True)
 class AccountTransferWorkflowScenarios:
-    """Dynamic workflow that handles all non-happy-path scenarios.
 
-    Branches on workflow_type to handle:
-    - AccountTransferWorkflowAdvancedVisibility
-    - AccountTransferWorkflowHumanInLoop
-    - AccountTransferWorkflowRecoverableFailure (bug in workflow)
-    - AccountTransferWorkflowAPIDowntime
-    - AccountTransferWorkflowInvalidAccount
-    """
+    BUG = "AccountTransferWorkflowRecoverableFailure"
+    NEEDS_APPROVAL = "AccountTransferWorkflowHumanInLoop"
+    ADVANCED_VISIBILITY = "AccountTransferWorkflowAdvancedVisibility"
+
+    WORKFLOW_STEP = SearchAttributeKey.for_keyword("Step")
+
+    approvalTime = 30
+    approved = False
 
     def __init__(self) -> None:
-        self._approval_status: str | None = None  # "approved" | "denied"
-        self._current_step = "pending"
-
-    @workflow.signal
-    def approve_transfer(self) -> None:
-        self._approval_status = "approved"
-
-    @workflow.signal
-    def deny_transfer(self) -> None:
-        self._approval_status = "denied"
-
-    @workflow.query
-    def get_status(self) -> str:
-        return self._current_step
+        self.progress = 0
+        self.transferState = ""
+        self.depositResponse = DepositResponse("")
+        self.start_to_close_timeout = timedelta(seconds=5)
+        self.retry_policy = AccountTransferActivities.retry_policy
 
     @workflow.run
-    async def run(self, args: Sequence[RawValue]) -> dict:
-        transfer_input = workflow.payload_converter().from_payload(
-            args[0].payload, dict
+    async def execute(self, args: Sequence[RawValue]) -> Any:
+        input = workflow.payload_converter().from_payload(
+            args[0].payload, TransferInput
         )
-        transfer_id = transfer_input["transfer_id"]
-        wf_type = workflow.info().workflow_type
-        compensations: list[tuple[str, dict]] = []
+        self.workflow_type = workflow.info().workflow_type
+        logger = workflow.logger
+        logger.info(
+            f"Dynamic Account Transfer Workflow started {self.workflow_type}, input = {input}"
+        )
+        idempotencyKey = str(workflow.uuid4())
 
-        try:
-            # Step 1: Validate
-            self._current_step = "validate"
-            if wf_type == "AccountTransferWorkflowAdvancedVisibility":
-                workflow.upsert_search_attributes({"Step": ["Validate"]})
-            await workflow.execute_activity(
-                validate_activity,
-                transfer_input,
-                start_to_close_timeout=timedelta(seconds=10),
-                retry_policy=RetryPolicy(
-                    maximum_attempts=3,
-                    non_retryable_error_types=["InvalidAccountError"],
-                ),
+        # Validate
+        self.upsertStep("Validate")
+        await workflow.execute_activity(
+            AccountTransferActivities.validate,
+            args=[input],
+            start_to_close_timeout=self.start_to_close_timeout,
+            retry_policy=self.retry_policy,
+        )
+        await self.updateProgress(25, 1)
+
+        if self.NEEDS_APPROVAL == self.workflow_type:
+            logger.info(
+                f"Waiting on 'approveTransfer' Signal for workflow ID: {workflow.info().workflow_id}"
             )
-
-            # Step 2: Withdraw — register compensation before executing
-            self._current_step = "withdraw"
-            if wf_type == "AccountTransferWorkflowAdvancedVisibility":
-                workflow.upsert_search_attributes({"Step": ["Withdraw"]})
-            compensations.append(("undo_withdraw", {**transfer_input}))
+            # Register the pending approval for the Bank Operations tab
             await workflow.execute_activity(
-                withdraw_activity,
-                transfer_input,
-                start_to_close_timeout=timedelta(seconds=15),
-                retry_policy=RetryPolicy(
-                    initial_interval=timedelta(seconds=2),
-                    backoff_coefficient=1.5,
-                    maximum_interval=timedelta(seconds=8),
-                    maximum_attempts=10,
-                ),
+                AccountTransferActivities.registerApproval,
+                args=[input],
+                start_to_close_timeout=timedelta(seconds=5),
             )
+            await self.updateProgressStatus(30, 0, "waiting")
 
-            # Human-in-the-Loop: wait for approval signal
-            if wf_type == "AccountTransferWorkflowHumanInLoop":
-                self._current_step = "approval_wait"
+            try:
+                await workflow.wait_condition(
+                    lambda: self.approved,
+                    timeout=timedelta(seconds=self.approvalTime),
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Approval not received within the {self.approvalTime} seconds"
+                )
+                # Clean up the pending approval from the Bank Operations tab
                 await workflow.execute_activity(
-                    register_approval_activity,
-                    transfer_input,
+                    AccountTransferActivities.removeApproval,
+                    args=[input],
                     start_to_close_timeout=timedelta(seconds=5),
                 )
-                try:
-                    await workflow.wait_condition(
-                        lambda: self._approval_status is not None,
-                        timeout=timedelta(seconds=30),
-                    )
-                except asyncio.TimeoutError:
-                    self._approval_status = "timed_out"
-
-                if self._approval_status == "timed_out":
-                    # Clean up the pending approval from the backend
-                    await workflow.execute_activity(
-                        remove_pending_approval_activity,
-                        transfer_input,
-                        start_to_close_timeout=timedelta(seconds=5),
-                    )
-                    raise Exception("Transfer timed out — no approval received")
-
-                if self._approval_status == "denied":
-                    raise Exception("Transfer denied by bank operations")
-
-            # Bug in Workflow: intentional error
-            if wf_type == "AccountTransferWorkflowRecoverableFailure":
-                raise RuntimeError(
-                    "BUG: Unexpected NoneType in fee calculation "
-                    "(fix requires worker redeployment with workflow.patched('fee-fix'))"
+                raise ApplicationError(
+                    f"Approval not received within {self.approvalTime} seconds",
+                    type="ApprovalTimeout",
+                    non_retryable=True,
                 )
 
-            # Step 3: Deposit
-            self._current_step = "deposit"
-            if wf_type == "AccountTransferWorkflowAdvancedVisibility":
-                workflow.upsert_search_attributes({"Step": ["Deposit"]})
+        # Withdraw
+        self.upsertStep("Withdraw")
+        await workflow.execute_activity(
+            AccountTransferActivities.withdraw,
+            args=[idempotencyKey, input.amount, self.workflow_type],
+            start_to_close_timeout=self.start_to_close_timeout,
+            retry_policy=self.retry_policy,
+        )
+        await self.updateProgress(50, 3)
+
+        if self.BUG == self.workflow_type:
+            raise RuntimeError("Simulated bug - fix me!")
+
+        # Deposit
+        self.upsertStep("Deposit")
+        try:
+            self.depositResponse = await workflow.execute_activity(
+                AccountTransferActivities.deposit,
+                args=[idempotencyKey, input.amount, self.workflow_type],
+                start_to_close_timeout=self.start_to_close_timeout,
+                retry_policy=self.retry_policy,
+            )
+            await self.updateProgress(75, 1)
+        except Exception as ex:
+            logger.info("Deposit failed unrecoverable error, reverting withdraw")
             await workflow.execute_activity(
-                deposit_activity,
-                transfer_input,
-                start_to_close_timeout=timedelta(seconds=15),
-                retry_policy=RetryPolicy(
-                    initial_interval=timedelta(seconds=2),
-                    backoff_coefficient=1.5,
-                    maximum_interval=timedelta(seconds=8),
-                    maximum_attempts=10,
-                ),
+                AccountTransferActivities.undoWithdraw,
+                args=[input.amount],
+                start_to_close_timeout=self.start_to_close_timeout,
+                retry_policy=self.retry_policy,
+            )
+            raise ApplicationError(
+                f"{ex.__cause__}",
+                type="DepositFailed",
+                non_retryable=True,
             )
 
-            # Step 4: Notify success
-            self._current_step = "notify"
-            if wf_type == "AccountTransferWorkflowAdvancedVisibility":
-                workflow.upsert_search_attributes({"Step": ["Notification"]})
-            await workflow.execute_activity(
-                send_notification_activity,
-                {**transfer_input, "success": True},
-                start_to_close_timeout=timedelta(seconds=10),
+        # Send Notification
+        self.upsertStep("Send notification")
+        await workflow.execute_activity(
+            AccountTransferActivities.sendNotification,
+            args=[input],
+            start_to_close_timeout=self.start_to_close_timeout,
+            retry_policy=self.retry_policy,
+        )
+        await self.updateProgressStatus(100, 1, "finished")
+
+        return TransferOutput(DepositResponse(self.depositResponse.get_chargeId()))
+
+    @workflow.signal(name="approveTransfer")
+    def approveTransferSignal(self) -> str:
+        workflow.logger.info("Approve Signal Received")
+        if self.transferState == "waiting":
+            self.approved = True
+        else:
+            workflow.logger.info(
+                "Approval not applied. Transfer is not waiting for approval"
             )
 
-            self._current_step = "completed"
-            return {"success": True, "transfer_id": transfer_id}
+    @workflow.query(name="transferStatus")
+    def queryTransferStatus(self) -> TransferStatus:
+        return TransferStatus(
+            self.progress,
+            self.transferState,
+            "",
+            self.depositResponse,
+            self.approvalTime,
+        )
 
-        except Exception as e:
-            workflow.logger.error(f"Transfer {transfer_id} failed: {e}")
-            self._current_step = "compensating"
-
-            async def run_compensations():
-                for comp_name, comp_input in reversed(compensations):
-                    if comp_name == "undo_withdraw":
-                        try:
-                            await workflow.execute_activity(
-                                undo_withdraw_activity,
-                                comp_input,
-                                start_to_close_timeout=timedelta(seconds=10),
-                                retry_policy=RetryPolicy(maximum_attempts=5),
-                            )
-                        except Exception as comp_err:
-                            workflow.logger.error(
-                                f"Compensation failed for {comp_name}: {comp_err}"
-                            )
-
-            await asyncio.shield(asyncio.ensure_future(run_compensations()))
-
-            self._current_step = "failed"
-            await workflow.execute_activity(
-                send_notification_activity,
-                {**transfer_input, "success": False},
-                start_to_close_timeout=timedelta(seconds=10),
+    def upsertStep(self, step: str) -> None:
+        if self.ADVANCED_VISIBILITY == self.workflow_type:
+            workflow.logger.info(f"Advanced visibility... On step: {step}")
+            workflow.upsert_search_attributes(
+                [self.WORKFLOW_STEP.value_set(step)]
             )
 
-            return {"success": False, "error": str(e), "transfer_id": transfer_id}
+    async def updateProgress(self, progress: int, sleep: int) -> None:
+        await self.updateProgressStatus(progress, sleep, "running")
+
+    async def updateProgressStatus(
+        self, progress: int, sleep: int, transferState: str
+    ) -> None:
+        if sleep > 0:
+            await asyncio.sleep(sleep)
+
+        self.transferState = transferState
+        self.progress = progress

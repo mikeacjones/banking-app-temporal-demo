@@ -2,31 +2,44 @@
 set -e
 
 # Banking Transfer Demo — Launcher
-# Usage: ./scripts/start.sh [--encrypt]
+# Usage: ./scripts/start.sh [--encrypt] [--cloud-env <path>]
 #
 # Prefers Docker for backend/worker/frontend.
 # Falls back to running everything locally if Docker isn't available.
-# Temporal CLI dev server always runs on the host.
+#
+# With --cloud-env: worker and backend connect to Temporal Cloud (no local server).
+# Without: starts a local Temporal dev server.
 #
 # Options:
-#   --encrypt   Enable AES-GCM payload encryption + codec server
+#   --encrypt              Enable AES-GCM payload encryption + codec server
+#   --cloud-env <path>     Load Temporal Cloud connection settings from env file
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MISSING=()
 ENCRYPT=""
+CLOUD_ENV=""
 
 # -- Parse flags --
-for arg in "$@"; do
-  case "$arg" in
-    --encrypt) ENCRYPT=1 ;;
-    *) echo "Unknown option: $arg"; exit 1 ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --encrypt) ENCRYPT=1; shift ;;
+    --cloud-env)
+      CLOUD_ENV="$2"
+      if [ -z "$CLOUD_ENV" ] || [ ! -f "$CLOUD_ENV" ]; then
+        echo "Error: --cloud-env requires a path to an existing env file"
+        exit 1
+      fi
+      shift 2
+      ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
 
-# -- Check Temporal CLI (always required) --
-command -v temporal >/dev/null 2>&1 || MISSING+=("temporal CLI  — brew install temporal")
+# -- Check prerequisites --
+if [ -z "$CLOUD_ENV" ]; then
+  command -v temporal >/dev/null 2>&1 || MISSING+=("temporal CLI  — brew install temporal")
+fi
 
-# -- Determine mode --
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   MODE="docker"
 else
@@ -35,7 +48,6 @@ else
   MODE="local"
 fi
 
-# -- Bail if anything is missing --
 if [ ${#MISSING[@]} -gt 0 ]; then
   echo "Missing required tools:"
   echo ""
@@ -45,6 +57,17 @@ if [ ${#MISSING[@]} -gt 0 ]; then
   echo ""
   echo "Install the above and try again."
   exit 1
+fi
+
+# -- Load cloud env if specified --
+CLOUD_VARS=""
+if [ -n "$CLOUD_ENV" ]; then
+  # Source the env file to get variables, filtering comments and blanks
+  set -a
+  source "$CLOUD_ENV"
+  set +a
+  # Build env string for passing to subprocesses
+  CLOUD_VARS="$(grep -v '^#' "$CLOUD_ENV" | grep -v '^$' | grep '=' | xargs)"
 fi
 
 cd "$ROOT_DIR"
@@ -67,6 +90,9 @@ trap cleanup SIGINT SIGTERM
 
 echo "======================================"
 echo "  Banking Transfer Demo Launcher"
+if [ -n "$CLOUD_ENV" ]; then
+  echo "  (Temporal Cloud: $TEMPORAL_NAMESPACE)"
+fi
 if [ "$ENCRYPT" = "1" ]; then
   echo "  (encryption enabled)"
 fi
@@ -78,22 +104,51 @@ if [ "$MODE" = "docker" ]; then
   docker compose --profile encrypt down --remove-orphans 2>/dev/null || true
 fi
 
-# -- Start Temporal dev server (always on host) --
-echo "Starting Temporal dev server..."
-temporal server start-dev --log-level warn --db-filename "/tmp/banking-demo-temporal-$$.db" &
-PIDS+=($!)
+# -- Start Temporal dev server (only when NOT using Cloud) --
+if [ -z "$CLOUD_ENV" ]; then
+  echo "Starting Temporal dev server..."
+  temporal server start-dev --log-level warn --db-filename "/tmp/banking-demo-temporal-$$.db" &
+  PIDS+=($!)
 
-echo "Waiting for Temporal..."
-for i in $(seq 1 15); do
-  if temporal operator namespace describe default >/dev/null 2>&1; then
-    break
+  echo "Waiting for Temporal..."
+  for i in $(seq 1 15); do
+    if temporal operator namespace describe default >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+
+  # Register search attribute for Advanced Visibility scenario
+  echo "Registering search attributes..."
+  temporal operator search-attribute create --name Step --type Keyword 2>/dev/null || true
+else
+  echo "Connecting to Temporal Cloud at $TEMPORAL_ADDRESS..."
+fi
+
+# -- Build the banner --
+build_banner() {
+  echo ""
+  echo "======================================"
+  echo "  Banking Transfer Demo is running!"
+  echo ""
+  echo "  App:        http://localhost:5173"
+  echo "  API:        http://localhost:8000"
+  if [ -n "$CLOUD_ENV" ]; then
+    echo "  Temporal:   $TEMPORAL_ADDRESS"
+    echo "  Namespace:  $TEMPORAL_NAMESPACE"
+  else
+    echo "  Temporal:   http://localhost:8233"
   fi
-  sleep 1
-done
-
-# Register search attribute for Advanced Visibility scenario
-echo "Registering search attributes..."
-temporal operator search-attribute create --name Step --type Keyword 2>/dev/null || true
+  if [ "$ENCRYPT" = "1" ]; then
+    echo ""
+    echo "  Encryption: ON (AES-GCM)"
+    echo "  Codec:      http://localhost:8081"
+    echo "              (set as codec endpoint in Temporal UI)"
+  fi
+  echo ""
+  echo "  Ctrl+C to stop $1"
+  echo "======================================"
+}
 
 # =============================================
 if [ "$MODE" = "docker" ]; then
@@ -107,24 +162,7 @@ if [ "$MODE" = "docker" ]; then
   echo "Starting Docker containers..."
   BANKING_ENCRYPT="${ENCRYPT}" docker compose $DOCKER_PROFILES up --build -d
 
-  BANNER_EXTRA=""
-  if [ "$ENCRYPT" = "1" ]; then
-    BANNER_EXTRA="\n  Encryption: ON (AES-GCM)"
-    BANNER_EXTRA="$BANNER_EXTRA\n  Codec:      http://localhost:8081"
-    BANNER_EXTRA="$BANNER_EXTRA\n              (set as codec endpoint in Temporal UI)"
-  fi
-
-  echo ""
-  echo "======================================"
-  echo "  Banking Transfer Demo is running!"
-  echo ""
-  echo "  App:        http://localhost:5173"
-  echo "  API:        http://localhost:8000"
-  echo "  Temporal:   http://localhost:8233"
-  echo -e "$BANNER_EXTRA"
-  echo ""
-  echo "  Ctrl+C to stop everything"
-  echo "======================================"
+  build_banner "everything"
 
   while true; do sleep 1; done
 
@@ -152,7 +190,6 @@ else
   BANKING_ENCRYPT="${ENCRYPT}" BANKING_BACKEND_URL=http://localhost:8000 uv run --package banking-demo-workflows worker &
   PIDS+=($!)
 
-  # Start codec server if encryption is enabled
   if [ "$ENCRYPT" = "1" ]; then
     echo "Starting codec server on :8081..."
     uv run python -m banking_workflows.codec_server &
@@ -163,24 +200,7 @@ else
   (cd "$ROOT_DIR/frontend" && npm run dev -- --open) &
   PIDS+=($!)
 
-  BANNER_EXTRA=""
-  if [ "$ENCRYPT" = "1" ]; then
-    BANNER_EXTRA="  Encryption: ON (AES-GCM)\n  Codec:      http://localhost:8081\n              (set as codec endpoint in Temporal UI)\n"
-  fi
-
-  echo ""
-  echo "======================================"
-  echo "  Banking Transfer Demo is running!"
-  echo ""
-  echo "  App:        http://localhost:5173"
-  echo "  API:        http://localhost:8000"
-  echo "  Temporal:   http://localhost:8233"
-  if [ -n "$BANNER_EXTRA" ]; then
-    echo -e "$BANNER_EXTRA"
-  fi
-  echo ""
-  echo "  Ctrl+C to stop all services"
-  echo "======================================"
+  build_banner "all services"
 
   wait
 fi
