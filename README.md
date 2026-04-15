@@ -2,6 +2,8 @@
 
 A live, interactive demo showing how [Temporal](https://temporal.io) handles money transfers with durable execution. Send money through an iPhone-style banking app, watch the behind-the-scenes workflow execute in real time, and explore six different scenarios — from happy path to API downtime to human-in-the-loop approval.
 
+![App demo gif](./.images/app-demo.gif)
+
 ## Quick Start
 
 **Prerequisites:** [Temporal CLI](https://docs.temporal.io/cli) + either Docker or ([uv](https://docs.astral.sh/uv/) + [Node.js](https://nodejs.org/))
